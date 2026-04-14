@@ -1,1 +1,1 @@
-"""Tool implementations for the tick-agent project."""
+"""Tool layer for General Agent."""

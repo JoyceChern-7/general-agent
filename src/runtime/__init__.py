@@ -1,1 +1,1 @@
-"""Runtime utilities for the tick-agent project."""
+"""Runtime services for General Agent."""

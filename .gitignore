@@ -1,0 +1,11 @@
+.general-agent/settings.json
+.general-agent/sessions/
+**/.general-agent/settings.json
+**/.general-agent/sessions/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+examples/
