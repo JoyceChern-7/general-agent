@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
+from config.paths import get_global_skills_dir, get_project_state_dir, get_skill_paths_path
 from runtime.ids import new_id
 from tools.base import BaseTool, ToolContext, ToolResult, emit_tool_output_delta, truncate_text
 from tools.governance import PermissionResult, ValidationResult
@@ -67,7 +68,7 @@ def _resolve_path(context: ToolContext, value: str | None, *, default: str = "."
 
 
 def _state_dir(context: ToolContext) -> Path:
-    path = _cwd(context) / ".siyi"
+    path = get_project_state_dir(_cwd(context))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -646,6 +647,21 @@ class ProcessSessionManager:
     def get(self, process_id: str) -> ProcessSession | None:
         return self.sessions.get(process_id)
 
+    async def stop_all(self) -> None:
+        sessions = list(self.sessions.values())
+        for session in sessions:
+            if session.is_running():
+                session.status = "stopping"
+                await _terminate_process_tree(session.process)
+        for session in sessions:
+            if session.is_running():
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(session.exit_event.wait(), timeout=2)
+            await _drain_reader_tasks(session.reader_tasks)
+            if session.status == "stopping":
+                session.status = "stopped"
+        self.sessions.clear()
+
     async def read(
         self,
         process_id: str,
@@ -1192,27 +1208,46 @@ class ToolSearchTool(BaseTool):
         },
     )
 
-    def __init__(self, registry_provider: Callable[[], list[Any]]) -> None:
+    def __init__(
+        self,
+        registry_provider: Callable[[], list[Any]],
+        alias_provider: Callable[[], dict[str, str]] | None = None,
+    ) -> None:
         self._registry_provider = registry_provider
+        self._alias_provider = alias_provider or (lambda: {})
 
     async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
         query = str(raw_input.get("query") or "").lower()
         max_results = int(raw_input.get("max_results") or 50)
         matches = []
+        aliases_by_target: dict[str, list[str]] = {}
+        for alias, target_name in self._alias_provider().items():
+            aliases_by_target.setdefault(target_name, []).append(alias)
         for tool in self._registry_provider():
-            haystack = f"{tool.name} {tool.description}".lower()
+            aliases = sorted(aliases_by_target.get(tool.name, []))
+            haystack = f"{tool.name} {' '.join(aliases)} {tool.description}".lower()
             if not query or query in haystack:
                 matches.append(
                     {
                         "name": tool.name,
+                        "aliases": aliases,
                         "description": tool.description,
                         "input_schema": tool.input_schema,
                     }
                 )
             if len(matches) >= max_results:
                 break
-        content = "\n".join(f"{item['name']}: {item['description']}" for item in matches)
+        content = "\n".join(
+            _format_tool_search_item(item)
+            for item in matches
+        )
         return _ok(content or "(no matching tools)", context, {"tools": matches})
+
+
+def _format_tool_search_item(item: JsonObject) -> str:
+    aliases = item.get("aliases") or []
+    alias_text = f" (aliases: {', '.join(aliases)})" if aliases else ""
+    return f"{item['name']}{alias_text}: {item['description']}"
 
 
 class AskUserQuestionTool(BaseTool):
@@ -1248,7 +1283,7 @@ class AskUserQuestionTool(BaseTool):
 
 class EnterPlanModeTool(BaseTool):
     name = "EnterPlanMode"
-    description = "Enter planning mode and persist the current plan state under .siyi."
+    description = "Enter planning mode and persist the current plan state in the SiYi project state directory."
     input_schema = _schema(
         {
             "plan": {"type": "string", "description": "Optional plan text."},
@@ -1269,7 +1304,7 @@ class EnterPlanModeTool(BaseTool):
 
 class ExitPlanModeTool(BaseTool):
     name = "ExitPlanMode"
-    description = "Exit planning mode and persist the current plan state under .siyi."
+    description = "Exit planning mode and persist the current plan state in the SiYi project state directory."
     input_schema = _schema({"reason": {"type": "string"}})
 
     async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
@@ -1514,7 +1549,7 @@ class TaskUpdateTool(BaseTool):
 
 class SkillTool(BaseTool):
     name = "Skill"
-    description = "List, read, or search local skill files from .siyi/skills and user skill roots."
+    description = "List, read, or search local skill files from global SiYi skill roots."
     read_only = True
     input_schema = _schema(
         {
@@ -1535,7 +1570,12 @@ class SkillTool(BaseTool):
         if action == "search":
             query = str(raw_input.get("query") or "").lower()
             matches = [
-                item for item in skills if query in item["name"].lower() or query in item["path"].lower()
+                item
+                for item in skills
+                if query in item["name"].lower()
+                or query in item["path"].lower()
+                or query in item["root"].lower()
+                or query in item["source"].lower()
             ]
             return _ok(
                 "\n".join(f"{item['name']}: {item['path']}" for item in matches) or "(no matches)",
@@ -1556,26 +1596,80 @@ class SkillTool(BaseTool):
 
 
 def _skill_roots(context: ToolContext) -> list[Path]:
-    roots = [_cwd(context) / ".siyi" / "skills"]
+    del context
+    root_entries: list[tuple[Path, str]] = [(get_global_skills_dir(), "default")]
+    root_entries.extend((path, "configured") for path in _load_skill_paths())
     env_root = os.environ.get("SIYI_SKILLS_DIR")
     if env_root:
-        roots.append(Path(env_root).expanduser())
-    home = Path.home()
-    roots.append(home / ".codex" / "skills")
-    return [root.resolve() for root in roots if root.exists()]
+        root_entries.append((Path(env_root).expanduser(), "env"))
+    return [
+        root.resolve()
+        for root, _source in _dedupe_skill_roots(root_entries)
+        if root.exists() and root.is_dir()
+    ]
+
+
+def _load_skill_paths() -> list[Path]:
+    path = get_skill_paths_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw_paths = payload.get("paths") if isinstance(payload, dict) else None
+    if not isinstance(raw_paths, list):
+        return []
+    return [
+        Path(str(raw_path)).expanduser()
+        for raw_path in raw_paths
+        if raw_path
+    ]
+
+
+def _dedupe_skill_roots(root_entries: list[tuple[Path, str]]) -> list[tuple[Path, str]]:
+    seen: set[str] = set()
+    result: list[tuple[Path, str]] = []
+    for root, source in root_entries:
+        resolved = root.expanduser().resolve()
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((resolved, source))
+    return result
 
 
 def _discover_skills(roots: list[Path]) -> list[JsonObject]:
     skills = []
     for root in roots:
         for path in root.rglob("SKILL.md"):
-            skills.append({"name": path.parent.name, "path": str(path)})
+            skills.append(
+                {
+                    "name": path.parent.name,
+                    "path": str(path),
+                    "root": str(root),
+                    "source": _skill_root_source(root),
+                }
+            )
     return sorted(skills, key=lambda item: item["name"])
+
+
+def _skill_root_source(root: Path) -> str:
+    root = root.resolve()
+    for candidate, source in _dedupe_skill_roots(
+        [(get_global_skills_dir(), "default")]
+        + [(path, "configured") for path in _load_skill_paths()]
+        + ([(Path(os.environ["SIYI_SKILLS_DIR"]).expanduser(), "env")] if os.environ.get("SIYI_SKILLS_DIR") else [])
+    ):
+        if candidate == root:
+            return source
+    return "unknown"
 
 
 class ListMcpResourcesTool(BaseTool):
     name = "ListMcpResourcesTool"
-    description = "List local MCP resource descriptors from .siyi/mcp."
+    description = "List local MCP resource descriptors from the SiYi project state directory."
     read_only = True
     input_schema = _schema({"server": {"type": "string"}})
 
@@ -1588,7 +1682,7 @@ class ListMcpResourcesTool(BaseTool):
 
 class ReadMcpResourceTool(BaseTool):
     name = "ReadMcpResourceTool"
-    description = "Read a local MCP resource by uri from .siyi/mcp resources."
+    description = "Read a local MCP resource by uri from the SiYi project state directory."
     read_only = True
     input_schema = _schema({"uri": {"type": "string"}, "server": {"type": "string"}}, required=["uri"])
 
@@ -1628,7 +1722,7 @@ def _local_mcp_resources(context: ToolContext) -> list[JsonObject]:
 
 class WorkflowTool(BaseTool):
     name = "workflow"
-    description = "List, get, or run JSON workflow definitions from .siyi/workflows."
+    description = "List, get, or run JSON workflow definitions from the SiYi project state directory."
     input_schema = _schema(
         {
             "action": {"type": "string", "enum": ["list", "get", "run"], "default": "list"},
@@ -1705,7 +1799,7 @@ def _load_workflow_definition(context: ToolContext, name: str) -> JsonObject | N
 
 class ConfigTool(BaseTool):
     name = "Config"
-    description = "Get, set, list, or delete local SiYi config values stored in .siyi/config.json."
+    description = "Get, set, list, or delete local SiYi config values stored in the SiYi project state directory."
     input_schema = _schema(
         {
             "action": {"type": "string", "enum": ["get", "set", "list", "delete"], "default": "list"},
@@ -1738,29 +1832,6 @@ class ConfigTool(BaseTool):
         config[str(key)] = raw_input.get("value")
         _write_json_file(path, config)
         return _ok(f"set {key}", context, {"key": key, "value": config[str(key)]})
-
-
-class AliasTool(BaseTool):
-    def __init__(self, name: str, target: BaseTool) -> None:
-        self.name = name
-        self.description = f"Alias for {target.name}. {target.description}"
-        self.input_schema = target.input_schema
-        self._target = target
-
-    async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
-        return await self._target.run(raw_input, context)
-
-    def validate_input(self, raw_input: JsonObject, context: ToolContext) -> ValidationResult:
-        return self._target.validate_input(raw_input, context)
-
-    def check_permissions(self, raw_input: JsonObject, context: ToolContext) -> PermissionResult:
-        return self._target.check_permissions(raw_input, context)
-
-    def is_read_only(self, raw_input: JsonObject) -> bool:
-        return self._target.is_read_only(raw_input)
-
-    def is_concurrency_safe(self, raw_input: JsonObject) -> bool:
-        return self._target.is_concurrency_safe(raw_input)
 
 
 def register_builtin_tools(registry: Any) -> None:
@@ -1801,7 +1872,7 @@ def register_builtin_tools(registry: Any) -> None:
     for tool in tools:
         registry.register(tool)
 
-    registry.register(ToolSearchTool(registry.get_tools))
+    registry.register(ToolSearchTool(registry.get_tools, registry.get_aliases))
     registry.register(WorkflowTool(lambda: registry))
 
     aliases = {
@@ -1820,4 +1891,4 @@ def register_builtin_tools(registry: Any) -> None:
     for alias, target_name in aliases.items():
         target = registry.find_tool(target_name)
         if target is not None:
-            registry.register(AliasTool(alias, target))
+            registry.register_alias(alias, target_name)

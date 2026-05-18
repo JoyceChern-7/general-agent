@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
 from engine.query_engine import SessionSnapshot
+from runtime.session_store import SessionMetadata
 from engine.events import (
     AssistantDeltaEvent,
     AssistantDoneEvent,
@@ -121,6 +124,9 @@ class ConsoleRenderer:
         table.add_column("Value")
         table.add_row("session", snapshot.session_id)
         table.add_row("cwd", snapshot.cwd)
+        table.add_row("project", snapshot.project_id)
+        table.add_row("project_state", snapshot.project_state_dir)
+        table.add_row("session_path", snapshot.session_path)
         table.add_row("model", snapshot.model)
         table.add_row("turns", str(snapshot.turn_count))
         table.add_row("completed_turns", str(snapshot.completed_turns))
@@ -128,6 +134,32 @@ class ConsoleRenderer:
         table.add_row("last_error", snapshot.last_error or "-")
         table.add_row("usage", str(snapshot.total_usage))
         table.add_row("estimated_cost", f"{snapshot.estimated_total_cost:.6f}")
+        self.console.print(table)
+
+    def render_sessions(
+        self,
+        sessions: list[SessionMetadata],
+        *,
+        current_session_id: str,
+    ) -> None:
+        table = Table(title="Sessions")
+        table.add_column("")
+        table.add_column("session")
+        table.add_column("cwd")
+        table.add_column("model")
+        table.add_column("messages", justify="right")
+        table.add_column("updated")
+        for metadata in sessions:
+            marker = "*" if metadata.session_id == current_session_id else ""
+            cwd_name = Path(metadata.cwd).name if metadata.cwd else "(legacy)"
+            table.add_row(
+                marker,
+                metadata.session_id,
+                cwd_name,
+                metadata.model or "-",
+                str(metadata.message_count),
+                metadata.updated_at,
+            )
         self.console.print(table)
 
     def render_history(self, messages: list[Message], *, limit: int) -> None:

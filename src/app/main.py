@@ -47,12 +47,16 @@ def _resolve_cwd(options: CLIOptions) -> Path:
 
 def _initialize_process(options: CLIOptions) -> Path:
     cwd = _resolve_cwd(options)
-    os.chdir(cwd)
-    os.environ["SIYI_CWD"] = str(cwd)
+    _activate_cwd(cwd)
     os.environ["SIYI_ENTRYPOINT"] = (
         "worker" if options.internal_worker else "cli"
     )
     return cwd
+
+
+def _activate_cwd(cwd: Path) -> None:
+    os.chdir(cwd)
+    os.environ["SIYI_CWD"] = str(cwd)
 
 
 def build_runtime(options: CLIOptions) -> AppRuntime:
@@ -70,9 +74,22 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         },
     )
 
+    session_store = JsonlSessionStore(settings.runtime.session_dir)
+    session = session_store.open_session(
+        requested_session=settings.runtime.resume,
+        cwd=cwd,
+        model=settings.model.model,
+    )
+    session_cwd = Path(session.metadata.cwd).expanduser().resolve()
+    if not session_cwd.exists() or not session_cwd.is_dir():
+        raise ValueError(f"Session working directory does not exist: {session_cwd}")
+    if session_cwd != settings.runtime.cwd:
+        _activate_cwd(session_cwd)
+        settings.runtime.cwd = session_cwd
+        cwd = session_cwd
+
     permission_manager = PermissionManager.from_settings(settings.tools, cwd=cwd)
     tool_registry = ToolRegistry.default(permission_manager=permission_manager)
-    session_store = JsonlSessionStore(settings.runtime.session_dir)
     compaction_manager = CompactionManager(settings.runtime.compaction_enabled)
     token_budget = TokenBudget(settings.runtime)
     usage_tracker = UsageTracker(settings.model.pricing)
@@ -80,10 +97,6 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
     renderer = ConsoleRenderer(
         debug=settings.runtime.debug,
         print_thinking=settings.model.print_thinking,
-    )
-    session = session_store.open_session(
-        requested_session=settings.runtime.resume,
-        cwd=cwd,
     )
     query_engine = QueryEngine(
         session=session, 

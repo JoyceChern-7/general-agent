@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from config.settings import AppSettings
 from engine.events import (
@@ -23,7 +25,7 @@ from engine.turn_state import QueryTurnState
 from llm.base import LLMAdapter
 from runtime.compaction import CompactionManager, CompactionResult
 from runtime.permissions import PermissionManager
-from runtime.session_store import JsonlSessionStore, SessionHandle
+from runtime.session_store import JsonlSessionStore, SessionHandle, SessionMetadata
 from runtime.token_budget import BudgetSnapshot, TokenBudget
 from runtime.usage_tracker import UsageTracker
 from tools.base import ToolContext
@@ -36,6 +38,9 @@ LOGGER = logging.getLogger(__name__)
 class SessionSnapshot:
     session_id: str
     cwd: str
+    project_id: str
+    project_state_dir: str
+    session_path: str
     model: str
     turn_count: int
     message_count: int
@@ -77,6 +82,7 @@ class QueryEngine:
         self.current_turn: QueryTurnState | None = None
         self.turn_counter = self._derive_turn_counter()
         self.auto_compact_failures = 0
+        self.usage_tracker.rebuild_from_messages(self.mutable_messages)
 
     async def submit_user_input(self, text: str) -> AsyncIterator[QueryEvent]:
         prompt = text.strip() 
@@ -238,6 +244,38 @@ class QueryEngine:
             self.auto_compact_failures = 0
         return result
 
+    async def new_session(self) -> SessionSnapshot:
+        await self._clear_process_sessions()
+        session = self.session_store.create_session(
+            cwd=self.settings.runtime.cwd,
+            model=self.settings.model.model,
+        )
+        self._activate_session(session)
+        return self.get_session_snapshot()
+
+    async def switch_session(self, session_id: str) -> SessionSnapshot:
+        metadata = self.session_store.get_metadata(session_id)
+        if metadata is None:
+            raise ValueError(f"Session not found: {session_id}")
+        if metadata.legacy or not metadata.cwd:
+            raise ValueError(f"Session has no cwd metadata: {session_id}")
+
+        cwd = Path(metadata.cwd).expanduser().resolve()
+        if not cwd.exists() or not cwd.is_dir():
+            raise ValueError(f"Session working directory does not exist: {cwd}")
+
+        session = self.session_store.switch_session(session_id)
+        await self._clear_process_sessions()
+        os.chdir(cwd)
+        os.environ["SIYI_CWD"] = str(cwd)
+        self.settings.runtime.cwd = cwd
+        self.permission_manager.reload_for_cwd(cwd)
+        self._activate_session(session)
+        return self.get_session_snapshot()
+
+    def list_sessions(self) -> list[SessionMetadata]:
+        return self.session_store.list_sessions()
+
     async def _compact_messages(
         self,
         messages: list[Message],
@@ -362,6 +400,20 @@ class QueryEngine:
             and not message.has_tool_result()
         )
 
+    def _activate_session(self, session: SessionHandle) -> None:
+        self.session = session
+        self.mutable_messages = list(session.messages)
+        self.current_turn = None
+        self.last_error = None
+        self.turn_counter = self._derive_turn_counter()
+        self.auto_compact_failures = 0
+        self.usage_tracker.rebuild_from_messages(self.mutable_messages)
+
+    async def _clear_process_sessions(self) -> None:
+        from tools.builtin import PROCESSES
+
+        await PROCESSES.stop_all()
+
     def transcript_preview(self) -> str:
         return "\n".join(
             f"{message.role}: {message.to_plain_text()}"
@@ -396,6 +448,9 @@ class QueryEngine:
         return SessionSnapshot(
             session_id=self.session.session_id,
             cwd=str(self.settings.runtime.cwd),
+            project_id=self.session.metadata.project_id,
+            project_state_dir=self.session.metadata.project_state_dir,
+            session_path=str(self.session.path),
             model=self.settings.model.model,
             turn_count=self.turn_counter,
             message_count=len(self.mutable_messages),

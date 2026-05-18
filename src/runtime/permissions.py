@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from config.paths import get_siyi_config_home
+from config.paths import get_project_state_dir, get_siyi_config_home
 from config.settings import ToolSettings
 from tools.base import ToolContext
 from tools.governance import PermissionResult
@@ -103,9 +103,10 @@ class PermissionManager:
         raw_input: dict[str, Any],
         context: ToolContext,
     ) -> PermissionResult:
-        tool_name = str(getattr(tool, "name", ""))
+        permission_tool_name = str(getattr(tool, "permission_name", getattr(tool, "name", "")))
+        display_tool_name = context.tool_name or str(getattr(tool, "name", ""))
         tool_decision = getattr(tool, "check_permissions")(raw_input, context)
-        global_decision = self.check(tool_name, raw_input, {"cwd": context.cwd})
+        global_decision = self.check(permission_tool_name, raw_input, {"cwd": context.cwd})
         decision = _combine_permissions(tool_decision, global_decision)
         if decision.decision != "ask":
             return decision
@@ -118,10 +119,10 @@ class PermissionManager:
 
         approved = await self.requester(
             PermissionRequest(
-                tool_name=tool_name,
+                tool_name=display_tool_name,
                 tool_input=raw_input,
                 reason=decision.reason or "permission required",
-                summary=_tool_input_summary(tool_name, raw_input),
+                summary=_tool_input_summary(display_tool_name, raw_input),
                 cwd=context.cwd,
             )
         )
@@ -197,7 +198,7 @@ class PermissionManager:
 
 
 def load_permission_config(cwd: Path | None) -> PermissionConfig:
-    project_path = (cwd / ".siyi" / "permissions.json") if cwd else None
+    project_path = (get_project_state_dir(cwd) / "permissions.json") if cwd else None
     if project_path and project_path.exists():
         return _read_permission_config(project_path)
 

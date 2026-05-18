@@ -212,8 +212,9 @@
       "bases:新建数据库": false
     }
   },
-  "active": "a426b09be583d2b4",
+  "active": "ec575d4ec49a317b",
   "lastOpenFiles": [
+    "src/runtime/session_store.py",
     "Note/openai_adapter.py.md",
     "Note/从启动, 用户输入到输出交互结果.md",
     "Note/message_schema.md",

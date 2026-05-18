@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from config.settings import ModelSettings
+from runtime.permissions import PermissionRequest
 from ui.controller import REPLController
 from ui.input_parser import parse_input
 
@@ -14,6 +15,9 @@ from ui.input_parser import parse_input
 class _Snapshot:
     session_id: str = "sess_test"
     cwd: str = "C:/workspace"
+    project_id: str = "workspace-123"
+    project_state_dir: str = "C:/home/.siyi/projects/workspace-123"
+    session_path: str = "C:/home/.siyi/sessions/sess_test.jsonl"
     model: str = "gpt-test"
     turn_count: int = 1
     message_count: int = 2
@@ -36,6 +40,9 @@ class _FakeRenderer:
 
     def render_session(self, snapshot) -> None:
         self.calls.append(("session", snapshot.session_id))
+
+    def render_sessions(self, sessions, *, current_session_id: str) -> None:
+        self.calls.append(("sessions", [item.session_id for item in sessions], current_session_id))
 
     def render_history(self, messages, *, limit: int) -> None:
         self.calls.append(("history", limit, list(messages)))
@@ -63,12 +70,27 @@ class _FakeEngine:
         self.last_user_prompt = "hello again"
         self.submitted_prompts: list[str] = []
         self.compact_instructions: str | None = None
+        self.sessions = [
+            SimpleNamespace(session_id="sess_test"),
+            SimpleNamespace(session_id="sess_other"),
+        ]
         self.settings = SimpleNamespace(
             model=ModelSettings(),
         )
         self.llm = SimpleNamespace(api_key=None, base_url=None, model=None)
 
     def get_session_snapshot(self):
+        return self.snapshot
+
+    def list_sessions(self):
+        return self.sessions
+
+    async def new_session(self):
+        self.snapshot = _Snapshot(session_id="sess_new")
+        return self.snapshot
+
+    async def switch_session(self, session_id: str):
+        self.snapshot = _Snapshot(session_id=session_id)
         return self.snapshot
 
     def get_recent_messages(self, limit: int = 10, *, include_meta: bool = False):
@@ -119,8 +141,13 @@ def test_controller_renders_help_and_session() -> None:
             "login",
             "compact",
             "session",
+            "sessions",
+            "session_new",
+            "session_switch",
             "history",
             "retry",
+            "add_skill_path",
+            "add_skills",
             "debug",
             "clear",
             "exit",
@@ -128,6 +155,20 @@ def test_controller_renders_help_and_session() -> None:
         ],
     )
     assert renderer.calls[1] == ("session", "sess_test")
+
+
+def test_controller_session_commands() -> None:
+    engine = _FakeEngine()
+    renderer = _FakeRenderer()
+    controller = REPLController(engine, renderer)
+
+    asyncio.run(controller.handle(parse_input("/sessions")))
+    asyncio.run(controller.handle(parse_input("/session_new")))
+    asyncio.run(controller.handle(parse_input("/session_switch sess_other")))
+
+    assert renderer.calls[0] == ("sessions", ["sess_test", "sess_other"], "sess_test")
+    assert renderer.calls[1] == ("note", "started new session: sess_new")
+    assert renderer.calls[2] == ("note", "switched to session: sess_other cwd=C:/workspace")
 
 
 def test_controller_history_validates_count() -> None:
@@ -198,6 +239,20 @@ class _FakePromptIO:
         return "depth"
 
 
+class _TrackingPromptIO:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+
+    async def choice(self, label: str, *, choices: tuple[str, ...], default: str) -> str:
+        del label, choices, default
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.01)
+        self.active -= 1
+        return "yes"
+
+
 def test_controller_login_saves_and_applies_user_settings(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SIYI_CONFIG_DIR", str(tmp_path))
     engine = _FakeEngine()
@@ -216,3 +271,137 @@ def test_controller_login_saves_and_applies_user_settings(tmp_path, monkeypatch)
     assert engine.settings.model.model == "depth-model"
     assert engine.llm.model == "depth-model"
     assert engine.submitted_prompts == []
+
+
+def test_controller_add_skill_path_validates_and_persists(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    extra = tmp_path / "extra-skills"
+    extra.mkdir()
+    monkeypatch.setattr("config.paths.Path.home", lambda: home)
+    engine = _FakeEngine()
+    renderer = _FakeRenderer()
+    controller = REPLController(engine, renderer)
+
+    asyncio.run(controller.handle(parse_input("/add_skill_path")))
+    asyncio.run(controller.handle(parse_input(f"/add_skill_path {extra}")))
+    asyncio.run(controller.handle(parse_input(f"/add_skill_path {extra}")))
+
+    config_path = home / ".siyi" / "skill_paths.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload == {"paths": [str(extra.resolve())]}
+    assert renderer.calls[0] == ("error", "usage: /add_skill_path <path>")
+    assert renderer.calls[1] == ("note", f"added skill path: {extra.resolve()}")
+    assert renderer.calls[2] == ("note", f"added skill path: {extra.resolve()}")
+
+
+def test_controller_add_skill_path_rejects_missing_and_file_paths(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("config.paths.Path.home", lambda: tmp_path / "home")
+    file_path = tmp_path / "not-a-dir"
+    file_path.write_text("x", encoding="utf-8")
+    controller = REPLController(_FakeEngine(), _FakeRenderer())
+    renderer = controller.renderer
+
+    asyncio.run(controller.handle(parse_input(f"/add_skill_path {tmp_path / 'missing'}")))
+    asyncio.run(controller.handle(parse_input(f"/add_skill_path {file_path}")))
+
+    assert renderer.calls[0][0] == "error"
+    assert "does not exist" in renderer.calls[0][1]
+    assert renderer.calls[1][0] == "error"
+    assert "not a directory" in renderer.calls[1][1]
+
+
+def test_github_clone_target_accepts_supported_forms() -> None:
+    from ui.controller import _github_clone_target
+
+    assert _github_clone_target("owner/repo") == ("https://github.com/owner/repo.git", "repo")
+    assert _github_clone_target("https://github.com/owner/repo") == (
+        "https://github.com/owner/repo.git",
+        "repo",
+    )
+    assert _github_clone_target("https://github.com/owner/repo.git") == (
+        "https://github.com/owner/repo.git",
+        "repo",
+    )
+    assert _github_clone_target("git@github.com:owner/repo.git") == (
+        "git@github.com:owner/repo.git",
+        "repo",
+    )
+
+
+def test_controller_add_skills_rejects_existing_target(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setattr("config.paths.Path.home", lambda: home)
+    target = home / ".siyi" / "skills" / "repo"
+    target.mkdir(parents=True)
+    controller = REPLController(_FakeEngine(), _FakeRenderer())
+
+    asyncio.run(controller.handle(parse_input("/add_skills owner/repo")))
+
+    assert controller.renderer.calls == [("error", f"skills repository already exists: {target}")]
+
+
+def test_controller_add_skills_clones_github_repo(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setattr("config.paths.Path.home", lambda: home)
+    calls = []
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def fake_create_subprocess_exec(*args, stdout=None, stderr=None):
+        calls.append((args, stdout, stderr))
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    controller = REPLController(_FakeEngine(), _FakeRenderer())
+
+    asyncio.run(controller.handle(parse_input("/add_skills owner/repo")))
+
+    target = home / ".siyi" / "skills" / "repo"
+    assert calls[0][0] == ("git", "clone", "https://github.com/owner/repo.git", str(target))
+    assert controller.renderer.calls[-1] == ("note", f"installed skills repository: {target}")
+
+
+def test_controller_add_skills_surfaces_git_failure(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("config.paths.Path.home", lambda: tmp_path / "home")
+
+    class _FakeProcess:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"fatal clone failed"
+
+    async def fake_create_subprocess_exec(*args, stdout=None, stderr=None):
+        del args, stdout, stderr
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    controller = REPLController(_FakeEngine(), _FakeRenderer())
+
+    asyncio.run(controller.handle(parse_input("/add_skills owner/repo")))
+
+    assert controller.renderer.calls[-1] == ("error", "git clone failed: fatal clone failed")
+
+
+def test_permission_prompts_are_serialized() -> None:
+    prompt_io = _TrackingPromptIO()
+    controller = REPLController(_FakeEngine(), _FakeRenderer(), prompt_io=prompt_io)
+    request = PermissionRequest(
+        tool_name="Write",
+        tool_input={"file_path": "a.txt"},
+        reason="tool can modify local state",
+        summary="Write(a.txt)",
+        cwd="C:/workspace",
+    )
+
+    async def run_two_prompts() -> list[bool]:
+        return await asyncio.gather(
+            controller._ask_permission(request),
+            controller._ask_permission(request),
+        )
+
+    assert asyncio.run(run_two_prompts()) == [True, True]
+    assert prompt_io.max_active == 1

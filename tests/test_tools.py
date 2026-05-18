@@ -9,7 +9,8 @@ from pathlib import Path
 
 from app.cli import parse_args
 from app.main import build_runtime
-from engine.events import FinalAnswerEvent, ToolOutputDeltaEvent, ToolResultEvent
+from config.paths import get_project_state_dir
+from engine.events import ErrorEvent, FinalAnswerEvent, ToolOutputDeltaEvent, ToolResultEvent
 from engine.message_schema import ToolResultBlock, ToolUseBlock
 from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMToolUse
 from runtime.usage_tracker import Usage
@@ -25,6 +26,20 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
 
     names = {tool.name for tool in runtime.tool_registry.get_tools()}
+    model_tool_names = {
+        schema["function"]["name"]
+        for schema in runtime.tool_registry.to_model_tool_schemas()
+    }
+    alias_names = {
+        "read_file",
+        "edit_file",
+        "write_file",
+        "web_search",
+        "web_fetch",
+        "glob",
+        "grep",
+        "shell",
+    }
 
     expected = {
         "Read",
@@ -63,6 +78,29 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
     if sys.platform.startswith("win"):
         expected.add("PowerShell")
     assert expected <= names
+    assert alias_names.isdisjoint(names)
+    assert alias_names.isdisjoint(model_tool_names)
+    assert expected <= model_tool_names
+
+
+def test_registry_resolves_aliases_without_exposing_them_to_model(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    registry = runtime.tool_registry
+
+    assert registry.get_aliases()["read_file"] == "Read"
+    assert registry.find_tool("read_file") is registry.find_tool("Read")
+    assert registry.find_tool("edit_file") is registry.find_tool("Edit")
+    assert registry.find_tool("write_file") is registry.find_tool("Write")
+    assert registry.find_tool("web_search") is registry.find_tool("WebSearch")
+    assert registry.find_tool("web_fetch") is registry.find_tool("WebFetch")
+    assert registry.find_tool("glob") is registry.find_tool("Glob")
+    assert registry.find_tool("grep") is registry.find_tool("Grep")
+
+    shell = registry.find_tool("shell")
+    if sys.platform.startswith("win"):
+        assert shell is registry.find_tool("PowerShell")
+    elif shutil.which("bash") is not None:
+        assert shell is registry.find_tool("Bash")
 
 
 def test_tool_schemas_remove_count_limits_except_tool_search(tmp_path: Path) -> None:
@@ -311,7 +349,7 @@ def test_process_session_supports_stdin_and_stop(tmp_path: Path) -> None:
 def test_project_management_and_lookup_tools_are_callable(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
     context = _context(tmp_path)
-    state = tmp_path / ".siyi"
+    state = get_project_state_dir(tmp_path)
     (state / "mcp").mkdir(parents=True)
     (state / "mcp" / "resources.json").write_text(
         json.dumps({"resources": [{"uri": "local://note", "name": "note", "text": "hello mcp"}]}),
@@ -351,6 +389,87 @@ def test_project_management_and_lookup_tools_are_callable(tmp_path: Path) -> Non
         await call("TaskUpdate", {"task_id": task_id, "status": "done"})
 
     asyncio.run(run_smoke())
+    assert not (tmp_path / ".siyi").exists()
+
+
+def test_skill_tool_uses_global_roots_and_configured_paths(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    cwd = tmp_path / "workspace"
+    default_skill = home / ".siyi" / "skills" / "default-skill"
+    project_skill = cwd / ".siyi" / "skills" / "project-skill"
+    codex_skill = home / ".codex" / "skills" / "codex-skill"
+    extra_root = tmp_path / "extra-skills"
+    extra_skill = extra_root / "extra-skill"
+    env_root = tmp_path / "env-skills"
+    env_skill = env_root / "env-skill"
+    for skill_dir in (default_skill, project_skill, codex_skill, extra_skill, env_skill):
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(f"# {skill_dir.name}", encoding="utf-8")
+    (home / ".siyi").mkdir(exist_ok=True)
+    (home / ".siyi" / "skill_paths.json").write_text(
+        json.dumps({"paths": [str(extra_root), str(extra_root), str(tmp_path / "missing")]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("config.paths.Path.home", lambda: home)
+    monkeypatch.setenv("SIYI_SKILLS_DIR", str(env_root))
+    runtime = build_runtime(parse_args(["--cwd", str(cwd)]))
+    context = _context(cwd)
+    skill = runtime.tool_registry.find_tool("Skill")
+    assert skill is not None
+
+    result = asyncio.run(skill.run({"action": "list"}, context))
+
+    assert result.success
+    assert result.data is not None
+    skills = {item["name"]: item for item in result.data["skills"]}
+    assert set(skills) == {"default-skill", "extra-skill", "env-skill"}
+    assert skills["default-skill"]["source"] == "default"
+    assert skills["extra-skill"]["source"] == "configured"
+    assert skills["env-skill"]["source"] == "env"
+    assert skills["extra-skill"]["root"] == str(extra_root.resolve())
+
+    search = asyncio.run(skill.run({"action": "search", "query": extra_root.name}, context))
+    assert search.success
+    assert search.data is not None
+    assert [item["name"] for item in search.data["skills"]] == ["extra-skill"]
+
+
+def test_skill_tool_search_and_read_from_global_roots(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    skill_dir = home / ".siyi" / "skills" / "writer"
+    skill_dir.mkdir(parents=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text("# Writer\nUse for writing.", encoding="utf-8")
+    monkeypatch.setattr("config.paths.Path.home", lambda: home)
+    monkeypatch.delenv("SIYI_SKILLS_DIR", raising=False)
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    skill = runtime.tool_registry.find_tool("Skill")
+    assert skill is not None
+
+    search = asyncio.run(skill.run({"action": "search", "query": "writer"}, context))
+    read = asyncio.run(skill.run({"action": "read", "name": "writer"}, context))
+
+    assert search.success
+    assert search.data is not None
+    assert search.data["skills"][0]["path"] == str(skill_path)
+    assert read.success
+    assert read.content == "# Writer\nUse for writing."
+
+
+def test_tool_search_finds_hidden_aliases(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    tool_search = runtime.tool_registry.find_tool("ToolSearch")
+    assert tool_search is not None
+
+    result = asyncio.run(tool_search.run({"query": "read_file"}, context))
+
+    assert result.success
+    assert result.data is not None
+    assert result.data["tools"][0]["name"] == "Read"
+    assert "read_file" in result.data["tools"][0]["aliases"]
+    assert "Read (aliases: read_file)" in result.content
 
 
 class ToolCallingLLM(LLMAdapter):
@@ -390,6 +509,36 @@ class ToolCallingLLM(LLMAdapter):
         yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
 
 
+class MultiReadAliasLLM(LLMAdapter):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_chat(
+        self,
+        messages,
+        system_prompt: str,
+        tools,
+        temperature: float,
+    ) -> AsyncIterator[LLMTextDelta | LLMToolUse | LLMAssistantDone]:
+        del system_prompt, tools, temperature
+        self.calls += 1
+        if self.calls == 1:
+            for index in range(4):
+                yield LLMToolUse(
+                    block=ToolUseBlock(
+                        id=f"toolu_read_{index}",
+                        name="read_file",
+                        input={"file_path": f"file-{index}.txt"},
+                    )
+                )
+            yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+            return
+
+        assert sum(1 for message in messages if message.has_tool_result()) >= 4
+        yield LLMTextDelta(delta="read aliases complete")
+        yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+
+
 class ProgressTool(BaseTool):
     name = "ProgressTool"
     description = "Emit a progress delta for tests."
@@ -424,8 +573,8 @@ class ProgressToolLLM(LLMAdapter):
 
 
 def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
-    permissions_dir = tmp_path / ".siyi"
-    permissions_dir.mkdir()
+    permissions_dir = get_project_state_dir(tmp_path)
+    permissions_dir.mkdir(parents=True)
     (permissions_dir / "permissions.json").write_text(
         json.dumps({"permissions": {"allow": ["Write(*)"]}}),
         encoding="utf-8",
@@ -444,9 +593,26 @@ def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
     assert runtime.query_engine.llm.calls == 2
 
 
+def test_concurrent_read_file_alias_calls_do_not_trigger_permission_prompt_crash(tmp_path: Path) -> None:
+    for index in range(4):
+        (tmp_path / f"file-{index}.txt").write_text(f"content {index}", encoding="utf-8")
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.query_engine.llm = MultiReadAliasLLM()
+
+    async def collect():
+        return [event async for event in runtime.query_engine.submit_user_input("read files")]
+
+    events = asyncio.run(collect())
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert sum(1 for event in events if isinstance(event, ToolResultEvent)) == 4
+    assert isinstance(events[-1], FinalAnswerEvent)
+    assert runtime.query_engine.llm.calls == 2
+
+
 def test_tool_output_delta_events_are_emitted_but_not_persisted(tmp_path: Path) -> None:
-    permissions_dir = tmp_path / ".siyi"
-    permissions_dir.mkdir()
+    permissions_dir = get_project_state_dir(tmp_path)
+    permissions_dir.mkdir(parents=True)
     (permissions_dir / "permissions.json").write_text(
         json.dumps({"permissions": {"allow": ["ProgressTool(*)"]}}),
         encoding="utf-8",
@@ -462,5 +628,12 @@ def test_tool_output_delta_events_are_emitted_but_not_persisted(tmp_path: Path) 
 
     assert any(isinstance(event, ToolOutputDeltaEvent) for event in events)
     assert isinstance(events[-1], FinalAnswerEvent)
-    transcript = runtime.query_engine.session.path.read_text(encoding="utf-8")
-    assert "tool_output_delta" not in transcript
+    entries = [
+        json.loads(line)
+        for line in runtime.query_engine.session.path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert not any(
+        entry.get("kind") == "event" and entry.get("event", {}).get("type") == "tool_output_delta"
+        for entry in entries
+    )

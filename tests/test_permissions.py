@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from config.settings import ToolSettings
+from config.paths import get_project_state_dir
 from engine.message_schema import ToolUseBlock
 from engine.query_loop import _tool_batches
 from runtime.permissions import PermissionManager
@@ -47,6 +49,48 @@ def test_default_process_session_permissions(tmp_path: Path, monkeypatch: pytest
     assert manager.check("ProcessStop", {"process_id": "proc_test"}).decision == "ask"
 
 
+def test_alias_tools_inherit_target_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIYI_CONFIG_DIR", str(tmp_path / "global"))
+    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    registry = ToolRegistry.default(manager)
+    context = _context(tmp_path)
+    requester_calls = 0
+
+    async def requester(_request) -> bool:
+        nonlocal requester_calls
+        requester_calls += 1
+        return True
+
+    manager.set_requester(requester)
+
+    async def authorize_alias(name: str, payload: dict) -> str:
+        tool = registry.find_tool(name)
+        assert tool is not None
+        result = await manager.authorize(tool, payload, context)
+        return result.decision
+
+    assert asyncio.run(authorize_alias("read_file", {"file_path": "README.md"})) == "allow"
+    assert asyncio.run(authorize_alias("glob", {"pattern": "*.py"})) == "allow"
+    assert asyncio.run(authorize_alias("grep", {"pattern": "x"})) == "allow"
+    assert asyncio.run(authorize_alias("web_search", {"query": "docs"})) == "allow"
+    assert requester_calls == 0
+
+
+def test_shell_alias_inherits_target_shell_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIYI_CONFIG_DIR", str(tmp_path / "global"))
+    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    registry = ToolRegistry.default(manager)
+    context = _context(tmp_path)
+    shell = registry.find_tool("shell")
+    if shell is None:
+        return
+
+    result = asyncio.run(manager.authorize(shell, {"command": "echo hi"}, context))
+
+    assert result.decision == "deny"
+    assert "permission required" in (result.reason or "")
+
+
 def test_project_permission_config_wins_over_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     global_dir = tmp_path / "global"
     global_dir.mkdir()
@@ -54,8 +98,8 @@ def test_project_permission_config_wins_over_global(tmp_path: Path, monkeypatch:
         json.dumps({"permissions": {"allow": ["Bash(*)"]}}),
         encoding="utf-8",
     )
-    project_dir = tmp_path / ".siyi"
-    project_dir.mkdir()
+    project_dir = get_project_state_dir(tmp_path)
+    project_dir.mkdir(parents=True)
     (project_dir / "permissions.json").write_text(
         json.dumps({"permissions": {"deny": ["Bash(*)"]}}),
         encoding="utf-8",
@@ -67,6 +111,28 @@ def test_project_permission_config_wins_over_global(tmp_path: Path, monkeypatch:
 
     assert result.decision == "deny"
     assert result.source == str(project_dir / "permissions.json")
+
+
+def test_cwd_siyi_permission_config_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "permissions.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash(*)"]}}),
+        encoding="utf-8",
+    )
+    legacy_dir = tmp_path / ".siyi"
+    legacy_dir.mkdir()
+    (legacy_dir / "permissions.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash(*)"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SIYI_CONFIG_DIR", str(global_dir))
+
+    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    result = manager.check("Bash", {"command": "git status"})
+
+    assert result.decision == "allow"
+    assert result.source == str(global_dir / "permissions.json")
 
 
 def test_interactive_approval_is_current_call_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,8 +158,8 @@ def test_interactive_approval_is_current_call_only(tmp_path: Path, monkeypatch: 
 
 
 def test_sandbox_required_on_native_windows_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    project_dir = tmp_path / ".siyi"
-    project_dir.mkdir()
+    project_dir = get_project_state_dir(tmp_path)
+    project_dir.mkdir(parents=True)
     (project_dir / "permissions.json").write_text(
         json.dumps(
             {

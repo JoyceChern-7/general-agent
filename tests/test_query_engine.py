@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -114,6 +115,67 @@ def test_query_engine_accumulates_multi_turn_history_and_resume(tmp_path: Path) 
     )
     assert resumed.query_engine.turn_counter == 2
     assert len(resumed.query_engine.get_messages()) == 4
+
+
+def test_global_session_index_and_cross_cwd_switch(tmp_path: Path) -> None:
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    first = build_runtime(parse_args(["--cwd", str(first_cwd)]))
+    first.query_engine.llm = FakeLLMAdapter(["first answer"])
+    asyncio.run(_collect_events(first.query_engine, "first question"))
+    first_session_id = first.query_engine.session.session_id
+
+    second = build_runtime(parse_args(["--cwd", str(second_cwd)]))
+    second_session_id = second.query_engine.session.session_id
+
+    sessions = second.query_engine.list_sessions()
+    assert {session.session_id for session in sessions} >= {first_session_id, second_session_id}
+    assert second.session_store.index_path.exists()
+
+    snapshot = asyncio.run(second.query_engine.switch_session(first_session_id))
+
+    assert snapshot.session_id == first_session_id
+    assert Path(snapshot.cwd) == first_cwd.resolve()
+    assert Path(os.environ["SIYI_CWD"]) == first_cwd.resolve()
+    assert second.query_engine.get_messages()[0].to_plain_text() == "first question"
+    assert second.query_engine.turn_counter == 1
+
+
+def test_session_switch_rejects_missing_cwd_without_changing_current_session(tmp_path: Path) -> None:
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    first = build_runtime(parse_args(["--cwd", str(first_cwd)]))
+    missing_session_id = first.query_engine.session.session_id
+    second = build_runtime(parse_args(["--cwd", str(second_cwd)]))
+    current_session_id = second.query_engine.session.session_id
+    current_cwd = second.query_engine.settings.runtime.cwd
+    first_cwd.rmdir()
+
+    try:
+        asyncio.run(second.query_engine.switch_session(missing_session_id))
+    except ValueError as exc:
+        assert "does not exist" in str(exc)
+    else:
+        raise AssertionError("switch should fail for a missing cwd")
+
+    assert second.query_engine.session.session_id == current_session_id
+    assert second.query_engine.settings.runtime.cwd == current_cwd
+
+
+def test_session_index_can_be_rebuilt_from_session_meta(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    session_id = runtime.query_engine.session.session_id
+    runtime.session_store.index_path.unlink()
+
+    sessions = runtime.session_store.list_sessions()
+
+    assert [session.session_id for session in sessions] == [session_id]
 
 
 def test_query_engine_does_not_block_when_budget_would_be_exceeded(tmp_path: Path) -> None:
