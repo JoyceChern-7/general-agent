@@ -1,1 +1,1 @@
-"""Application entrypoints for General Agent."""
+"""Application entrypoints for SiYi."""

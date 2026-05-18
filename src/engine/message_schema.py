@@ -165,13 +165,67 @@ def tool_result_message(
     )
 
 
-def compact_boundary_message(reason: str) -> Message:
+def compact_boundary_message(
+    reason: str | None = None,
+    *,
+    trigger: str = "manual",
+    pre_tokens: int = 0,
+    post_tokens: int | None = None,
+    tokens_saved: int | None = None,
+    preserved_message_ids: list[str] | None = None,
+) -> Message:
+    details = reason or f"{trigger} compact"
+    metadata: dict[str, Any] = {
+        "subtype": "compact_boundary",
+        "reason": details,
+        "trigger": trigger,
+        "pre_tokens": pre_tokens,
+    }
+    if post_tokens is not None:
+        metadata["post_tokens"] = post_tokens
+    if tokens_saved is not None:
+        metadata["tokens_saved"] = tokens_saved
+    if preserved_message_ids:
+        metadata["preserved_message_ids"] = preserved_message_ids
     return make_message(
         role="system",
         message_type="system",
-        blocks=[TextBlock(text=f"[compact_boundary] {reason}")],
+        blocks=[TextBlock(text=f"[compact_boundary] {details}")],
         is_meta=True,
-        metadata={"subtype": "compact_boundary", "reason": reason},
+        metadata=metadata,
+    )
+
+
+def compact_summary_message(
+    summary: str,
+    *,
+    custom_instructions: str | None = None,
+    transcript_path: str | None = None,
+) -> Message:
+    text = (
+        "This session is being continued from a previous conversation that ran "
+        "out of context. The summary below covers the earlier portion of the "
+        "conversation.\n\n"
+        f"{summary.strip()}"
+    )
+    if transcript_path:
+        text += (
+            "\n\nIf specific details from before compaction are needed, refer "
+            f"to the full transcript at: {transcript_path}"
+        )
+    text += "\n\nRecent messages may be preserved verbatim after this summary."
+    metadata: dict[str, Any] = {
+        "subtype": "compact_summary",
+        "send_to_provider": True,
+    }
+    if custom_instructions:
+        metadata["custom_instructions"] = custom_instructions
+    return make_message(
+        role="user",
+        message_type="user",
+        blocks=[TextBlock(text=text)],
+        is_meta=True,
+        metadata=metadata,
     )
 
 
@@ -199,7 +253,13 @@ def normalize_messages_for_api(messages: list[Message]) -> list[Message]:
         if message.metadata.get("subtype") == "compact_boundary":
             continue
 
-        if message.role == "user" and not message.is_meta and _is_plain_text_message(message):
+        send_to_provider = bool(message.metadata.get("send_to_provider"))
+
+        if (
+            message.role == "user"
+            and (not message.is_meta or send_to_provider)
+            and _is_plain_text_message(message)
+        ):
             pending_user_text.append(message.to_plain_text())
             continue
 
@@ -217,7 +277,7 @@ def normalize_messages_for_api(messages: list[Message]) -> list[Message]:
                 normalized.append(message)
                 continue
 
-        if message.role == "system" and not message.is_meta:
+        if message.role == "system" and (not message.is_meta or send_to_provider):
             normalized.append(message)
 
     flush_pending_user()

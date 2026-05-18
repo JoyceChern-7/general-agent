@@ -9,6 +9,7 @@ class ParsedInput(BaseModel):
     kind: Literal["message", "command", "empty"]
     text: str = ""
     command: str | None = None
+    args: list[str] = []
 
 
 def parse_input(raw: str) -> ParsedInput:
@@ -16,6 +17,9 @@ def parse_input(raw: str) -> ParsedInput:
     if not text:
         return ParsedInput(kind="empty")
     if text.startswith("/"):
-        command = text.split(maxsplit=1)[0][1:]
-        return ParsedInput(kind="command", text=text, command=command)
+        parts = text[1:].split()
+        if not parts:
+            return ParsedInput(kind="empty")
+        command, *args = parts
+        return ParsedInput(kind="command", text=text, command=command, args=args)
     return ParsedInput(kind="message", text=text)

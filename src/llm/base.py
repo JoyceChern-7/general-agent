@@ -14,6 +14,11 @@ class LLMTextDelta(BaseModel):
     delta: str
 
 
+class LLMThinkingDelta(BaseModel):
+    type: Literal["thinking_delta"] = "thinking_delta"
+    delta: str
+
+
 class LLMToolUse(BaseModel):
     type: Literal["tool_use"] = "tool_use"
     block: ToolUseBlock
@@ -24,7 +29,7 @@ class LLMAssistantDone(BaseModel):
     usage: Usage | None = None
 
 
-LLMEvent = LLMTextDelta | LLMToolUse | LLMAssistantDone
+LLMEvent = LLMTextDelta | LLMThinkingDelta | LLMToolUse | LLMAssistantDone
 
 
 class LLMAdapter:

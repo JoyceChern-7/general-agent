@@ -13,15 +13,44 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Note/main.py.md",
+                "file": "Note/openai_adapter.py.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "main.py"
+              "title": "openai_adapter.py"
+            }
+          },
+          {
+            "id": "a426b09be583d2b4",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Note/从启动, 用户输入到输出交互结果.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "从启动, 用户输入到输出交互结果"
+            }
+          },
+          {
+            "id": "a177b7c8e613aca5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Note/query_loop.py.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "query_loop.py"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -74,8 +103,7 @@
               "title": "书签"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "horizontal",
@@ -95,7 +123,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Note/main.py.md",
+                "file": "Agentic Workflow 计划书.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -105,7 +133,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "main.py 的反向链接列表"
+              "title": "Agentic Workflow 计划书 的反向链接列表"
             }
           },
           {
@@ -157,21 +185,21 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "Note/main.py.md",
+                "file": "Note/从启动, 用户输入到输出交互结果.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "main.py 的大纲"
+              "title": "从启动, 用户输入到输出交互结果 的大纲"
             }
           }
-        ]
+        ],
+        "currentTab": 4
       }
     ],
     "direction": "horizontal",
-    "width": 300,
-    "collapsed": true
+    "width": 300
   },
   "left-ribbon": {
     "hiddenItems": {
@@ -184,13 +212,33 @@
       "bases:新建数据库": false
     }
   },
-  "active": "09fa4a263d7d4823",
+  "active": "a426b09be583d2b4",
   "lastOpenFiles": [
-    "Note/settings.md",
-    "Note/settings.py",
+    "Note/openai_adapter.py.md",
+    "Note/从启动, 用户输入到输出交互结果.md",
+    "Note/message_schema.md",
+    "Note/query_engine.py.md",
+    "Note/query_loop.py.md",
+    "Note/编排层阅读顺序.md",
+    "Note/压缩机制.md",
     "Note/cli.py.md",
+    "Note/Event.py.md",
     "Note/main.py.md",
-    "feature.md",
-    "Note"
+    "Note/settings.md",
+    "Note/run_repl.py.md",
+    "Note/tokens budget.md",
+    "Note/token buget.md",
+    "src/video_project/__pycache__/store.cpython-313.pyc",
+    "tests/__pycache__/test_video_project.cpython-313-pytest-9.0.2.pyc",
+    "tests/test_video_project.py",
+    "src/video_project/__pycache__/seedance_request.cpython-313.pyc",
+    "src/agents/__pycache__/video_agents.cpython-313.pyc",
+    "src/video_project/__pycache__/models.cpython-313.pyc",
+    "src/video_project/__pycache__/__init__.cpython-313.pyc",
+    "src/video_project/__pycache__",
+    "src/integrations/__pycache__/seedance.cpython-313.pyc",
+    "src/integrations/__pycache__/image_generation.cpython-313.pyc",
+    "Agentic Workflow 计划书.md",
+    "feature.md"
   ]
 }

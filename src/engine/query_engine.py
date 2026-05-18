@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from collections.abc import AsyncIterator
 
 from config.settings import AppSettings
@@ -20,14 +21,28 @@ from engine.message_schema import (
 from engine.query_loop import DefaultQueryLoop, QueryLoop
 from engine.turn_state import QueryTurnState
 from llm.base import LLMAdapter
-from runtime.compaction import CompactionManager
+from runtime.compaction import CompactionManager, CompactionResult
 from runtime.permissions import PermissionManager
 from runtime.session_store import JsonlSessionStore, SessionHandle
 from runtime.token_budget import BudgetSnapshot, TokenBudget
 from runtime.usage_tracker import UsageTracker
+from tools.base import ToolContext
 from tools.registry import ToolRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    session_id: str
+    cwd: str
+    model: str
+    turn_count: int
+    message_count: int
+    completed_turns: int
+    last_error: str | None
+    total_usage: dict[str, int]
+    estimated_total_cost: float
 
 
 class QueryEngine:
@@ -59,8 +74,9 @@ class QueryEngine:
         self.query_loop = query_loop or DefaultQueryLoop()
         self.mutable_messages: list[Message] = list(session.messages)
         self.last_error: str | None = None
-        self.last_turn: QueryTurnState | None = None
+        self.current_turn: QueryTurnState | None = None
         self.turn_counter = self._derive_turn_counter()
+        self.auto_compact_failures = 0
 
     async def submit_user_input(self, text: str) -> AsyncIterator[QueryEvent]:
         prompt = text.strip() 
@@ -79,7 +95,7 @@ class QueryEngine:
         self.last_error = None
         user_msg = self._build_user_message(prompt)
         turn = self._create_turn_state(prompt, user_msg)
-        self.last_turn = turn
+        self.current_turn = turn
 
         self._append_message(user_msg)
         yield self._status(
@@ -95,50 +111,15 @@ class QueryEngine:
             turn_id=turn.turn_id,
         )
 
-        budget = self._prepare_turn(turn)
+        budget = await self._prepare_turn(turn)
         yield self._status(
             turn,
             f"estimated_tokens={budget.estimated_tokens}",
             code="budget_estimate",
             estimated_tokens=budget.estimated_tokens,
-            remaining_input_budget=budget.remaining_input_budget,
+            autocompact_threshold=budget.autocompact_threshold,
+            should_autocompact=budget.should_autocompact,
         )
-
-        if budget.should_warn:
-            yield self._status(
-                turn,
-                "request is approaching the configured context budget",
-                code="budget_warning",
-                estimated_tokens=budget.estimated_tokens,
-                warning_threshold=budget.warning_threshold,
-            )
-
-        if budget.should_autocompact:
-            yield self._status(
-                turn,
-                "request crossed the auto-compaction threshold",
-                code="autocompact_recommended",
-                estimated_tokens=budget.estimated_tokens,
-                autocompact_threshold=budget.autocompact_threshold,
-            )
-
-        if budget.is_blocking_limit:
-            turn.mark_failed("token_budget_exceeded", retryable=False)
-            self.last_error = turn.error
-            error = ErrorEvent(
-                session_id=turn.session_id,
-                turn_id=turn.turn_id,
-                message=(
-                    "request would exceed token budget: "
-                    f"estimated={budget.estimated_tokens}, "
-                    f"blocking_limit={budget.blocking_limit}"
-                ),
-                retryable=False,
-                code="token_budget_exceeded",
-            )
-            self.session_store.append_event(self.session, error)
-            yield error
-            return
 
         persisted_generated_count = 0
         try:
@@ -148,13 +129,24 @@ class QueryEngine:
                 system_prompt=self.settings.model.system_prompt,
                 tools=self.tool_registry.to_model_tool_schemas(),
                 temperature=self.settings.model.temperature,
+                tool_registry=self.tool_registry,
+                tool_context=ToolContext(
+                    cwd=str(self.settings.runtime.cwd),
+                    trace_id=turn.turn_id,
+                    session_id=turn.session_id,
+                    turn_id=turn.turn_id,
+                    max_result_chars=self.settings.tools.max_tool_result_chars,
+                ),
             ):
                 persisted_generated_count = self._drain_generated_messages(
                     turn,
                     persisted_generated_count,
                 )
+                # _attach_turn_metadata 负责补全事件中的 session_id 和 turn_id
+                # 最后还是返回 Event.
                 emitted = self._attach_turn_metadata(event, turn)
                 self._persist_event(emitted)
+                # 最后将事件 yield 出去，供 UI 层消费并渲染
                 yield emitted 
         except Exception as exc:  # noqa: BLE001
             if self.settings.runtime.debug:
@@ -203,28 +195,107 @@ class QueryEngine:
             turn_index=self.turn_counter,
             user_message=user_msg,
             prompt_text=prompt,
-            max_turns=self.settings.runtime.max_turns,
             messages=[*prior_messages, user_msg],
         )
 
-    def _prepare_turn(self, turn: QueryTurnState) -> BudgetSnapshot:
+    async def _prepare_turn(self, turn: QueryTurnState) -> BudgetSnapshot:
         turn.stage = "preflight"
-        compaction_result = self.compaction_manager.maybe_compact(turn.messages)
-        turn.messages_for_query = normalize_messages_for_api(
-            get_messages_after_compact_boundary(compaction_result.messages),
+        turn.messages_for_query = self._build_messages_for_query(turn.messages)
+        budget = self._evaluate_budget(turn.messages_for_query)
+
+        if self._should_try_auto_compact(turn.messages, budget):
+            try:
+                compaction_result = await self._compact_messages(
+                    turn.messages,
+                    trigger="auto",
+                )
+            except Exception as exc:  # noqa: BLE001 - auto compact should not kill the user turn
+                self.auto_compact_failures += 1
+                LOGGER.debug("query_engine.auto_compact_failed", exc_info=exc)
+            else:
+                if compaction_result.compacted:
+                    self._append_compaction_messages(compaction_result.messages_to_append)
+                    turn.messages = list(self.mutable_messages)
+                    turn.messages_for_query = normalize_messages_for_api(
+                        compaction_result.messages
+                    )
+                    budget = self._evaluate_budget(turn.messages_for_query)
+                    self.auto_compact_failures = 0
+                else:
+                    self.auto_compact_failures += 1
+
+        turn.estimated_input_tokens = budget.estimated_tokens
+        return budget
+
+    async def compact(self, custom_instructions: str | None = None) -> CompactionResult:
+        result = await self._compact_messages(
+            self.mutable_messages,
+            trigger="manual",
+            custom_instructions=custom_instructions,
         )
-        budget = self.token_budget.evaluate(
-            messages=turn.messages_for_query,
+        if result.compacted:
+            self._append_compaction_messages(result.messages_to_append)
+            self.auto_compact_failures = 0
+        return result
+
+    async def _compact_messages(
+        self,
+        messages: list[Message],
+        *,
+        trigger: str,
+        custom_instructions: str | None = None,
+    ) -> CompactionResult:
+        return await self.compaction_manager.compact_conversation(
+            list(messages),
+            llm=self.llm,
+            system_prompt=self.settings.model.system_prompt,
+            temperature=self.settings.model.temperature,
+            token_budget=self.token_budget,
+            trigger="auto" if trigger == "auto" else "manual",
+            custom_instructions=custom_instructions,
+            transcript_path=str(self.session.path),
+            cwd=self.settings.runtime.cwd,
+        )
+
+    def _build_messages_for_query(self, messages: list[Message]) -> list[Message]:
+        visible_messages = get_messages_after_compact_boundary(messages)
+        compaction_result = self.compaction_manager.microcompact_projection(visible_messages)
+        return normalize_messages_for_api(compaction_result.messages)
+
+    def _evaluate_budget(self, messages: list[Message]) -> BudgetSnapshot:
+        return self.token_budget.evaluate(
+            messages=messages,
             system_prompt=self.settings.model.system_prompt,
             tools=self.tool_registry.to_model_tool_schemas(),
         )
-        turn.estimated_input_tokens = budget.estimated_tokens
-        return budget
+
+    def _should_try_auto_compact(
+        self,
+        messages: list[Message],
+        budget: BudgetSnapshot,
+    ) -> bool:
+        if not self.settings.runtime.compaction_enabled:
+            return False
+        if not self.settings.runtime.auto_compact_enabled:
+            return False
+        if self.auto_compact_failures >= 3:
+            return False
+        if not budget.should_autocompact:
+            return False
+        visible_messages = get_messages_after_compact_boundary(messages)
+        return any(message.role == "assistant" for message in visible_messages)
 
     def _append_message(self, message: Message) -> None:
         self.mutable_messages.append(message)
         self.session_store.append_message(self.session, message)
 
+    def _append_compaction_messages(self, messages: list[Message]) -> None:
+        for message in messages:
+            self.mutable_messages.append(message)
+            self.session_store.append_message(self.session, message)
+
+    # store generated messages in the turn state until the turn is completed,
+    # then persist them all at once.
     def _drain_generated_messages(
         self,
         turn: QueryTurnState,
@@ -251,7 +322,7 @@ class QueryEngine:
         return event.model_copy(update=update) if update else event
 
     def _persist_event(self, event: QueryEvent) -> None:
-        if event.type == "assistant_delta":
+        if event.type in {"assistant_delta", "tool_output_delta"}:
             return
         self.session_store.append_event(self.session, event)
 
@@ -287,6 +358,7 @@ class QueryEngine:
             for message in self.mutable_messages
             if message.role == "user"
             and not message.is_meta
+            and not message.metadata.get("preserved_after_compact")
             and not message.has_tool_result()
         )
 
@@ -299,3 +371,36 @@ class QueryEngine:
 
     def get_messages(self) -> list[Message]:
         return list(self.mutable_messages)
+
+    def get_recent_messages(self, limit: int = 10, *, include_meta: bool = False) -> list[Message]:
+        visible_messages = [
+            message
+            for message in self.mutable_messages
+            if include_meta or not message.is_meta
+        ]
+        if limit <= 0:
+            return []
+        return visible_messages[-limit:]
+
+    def get_last_user_prompt(self) -> str | None:
+        for message in reversed(self.mutable_messages):
+            if message.role != "user":
+                continue
+            if message.is_meta or message.has_tool_result():
+                continue
+            return message.to_plain_text() or None
+        return None
+
+    def get_session_snapshot(self) -> SessionSnapshot:
+        total_usage = self.usage_tracker.get_total_usage()
+        return SessionSnapshot(
+            session_id=self.session.session_id,
+            cwd=str(self.settings.runtime.cwd),
+            model=self.settings.model.model,
+            turn_count=self.turn_counter,
+            message_count=len(self.mutable_messages),
+            completed_turns=len(self.usage_tracker.get_turn_history()),
+            last_error=self.last_error,
+            total_usage=total_usage.model_dump(),
+            estimated_total_cost=self.usage_tracker.estimate_cost(total_usage),
+        )

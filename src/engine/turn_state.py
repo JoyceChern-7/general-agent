@@ -12,7 +12,6 @@ TurnStage = Literal[
     "created",
     "preflight",
     "running",
-    "finalizing",
     "completed",
     "failed",
 ]
@@ -24,7 +23,6 @@ class QueryTurnState:
     turn_index: int
     user_message: Message
     prompt_text: str
-    max_turns: int
     turn_id: str = field(default_factory=lambda: new_id("turn"))
     started_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc),

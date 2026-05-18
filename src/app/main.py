@@ -48,9 +48,9 @@ def _resolve_cwd(options: CLIOptions) -> Path:
 def _initialize_process(options: CLIOptions) -> Path:
     cwd = _resolve_cwd(options)
     os.chdir(cwd)
-    os.environ["GENERAL_AGENT_CWD"] = str(cwd)
-    os.environ["GENERAL_AGENT_ENTRYPOINT"] = (
-        "sdk-cli" if options.non_interactive or options.prompt else "cli"
+    os.environ["SIYI_CWD"] = str(cwd)
+    os.environ["SIYI_ENTRYPOINT"] = (
+        "worker" if options.internal_worker else "cli"
     )
     return cwd
 
@@ -62,7 +62,7 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
 
     configure_logging(debug=settings.runtime.debug)
     LOGGER.debug(
-        "general_agent.startup.begin",
+        "siyi.startup.begin",
         extra={
             "cwd": str(cwd),
             "non_interactive": settings.runtime.non_interactive,
@@ -70,7 +70,7 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         },
     )
 
-    permission_manager = PermissionManager.from_settings(settings.tools)
+    permission_manager = PermissionManager.from_settings(settings.tools, cwd=cwd)
     tool_registry = ToolRegistry.default(permission_manager=permission_manager)
     session_store = JsonlSessionStore(settings.runtime.session_dir)
     compaction_manager = CompactionManager(settings.runtime.compaction_enabled)
@@ -81,7 +81,6 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         debug=settings.runtime.debug,
         print_thinking=settings.model.print_thinking,
     )
-
     session = session_store.open_session(
         requested_session=settings.runtime.resume,
         cwd=cwd,
@@ -111,16 +110,16 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         renderer=renderer,
     )
     LOGGER.debug(
-        "general_agent.startup.finished",
+        "siyi.startup.finished",
         extra={"startup_ms": round((time.perf_counter() - started_at) * 1000, 2)},
     )
     return runtime
 
 
-async def _run_non_interactive(runtime: AppRuntime, prompt: str | None) -> int:
+async def _run_internal_worker(runtime: AppRuntime, prompt: str | None) -> int:
     if not prompt:
         runtime.renderer.render_error(
-            "Non-interactive mode requires a prompt argument or piped stdin."
+            "Internal worker mode requires a prompt."
         )
         return 2
 
@@ -130,27 +129,19 @@ async def _run_non_interactive(runtime: AppRuntime, prompt: str | None) -> int:
 
 
 async def run(options: CLIOptions) -> int:
-    if options.non_interactive and not options.prompt:
-        configure_logging(debug=options.debug)
-        print(
-            "general-agent: --non-interactive requires a prompt argument or piped stdin.",
-            file=sys.stderr,
-        )
-        return 2
-
     try:
         runtime = build_runtime(options)
     except Exception as exc:  # noqa: BLE001 - startup must surface all failures cleanly
         configure_logging(debug=options.debug)
         if options.debug:
-            LOGGER.exception("general_agent.startup.failed")
+            LOGGER.exception("siyi.startup.failed")
         else:
-            LOGGER.debug("general_agent.startup.failed", exc_info=exc)
-        print(f"general-agent startup failed: {exc}", file=sys.stderr)
+            LOGGER.debug("siyi.startup.failed", exc_info=exc)
+        print(f"siyi startup failed: {exc}", file=sys.stderr)
         return 1
 
     if runtime.settings.runtime.non_interactive:
-        return await _run_non_interactive(runtime, runtime.settings.runtime.initial_prompt)
+        return await _run_internal_worker(runtime, runtime.settings.runtime.initial_prompt)
 
     await run_repl(runtime.query_engine, runtime.renderer)
     return 0

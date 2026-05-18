@@ -1,0 +1,466 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import sys
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from app.cli import parse_args
+from app.main import build_runtime
+from engine.events import FinalAnswerEvent, ToolOutputDeltaEvent, ToolResultEvent
+from engine.message_schema import ToolResultBlock, ToolUseBlock
+from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMToolUse
+from runtime.usage_tracker import Usage
+from tools.base import BaseTool, ToolContext, ToolResult, emit_tool_output_delta
+import tools.builtin as builtin_module
+
+
+def _context(tmp_path: Path) -> ToolContext:
+    return ToolContext(cwd=str(tmp_path), trace_id="test", max_result_chars=20_000)
+
+
+def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+
+    names = {tool.name for tool in runtime.tool_registry.get_tools()}
+
+    expected = {
+        "Read",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "ProcessStart",
+        "ProcessRead",
+        "ProcessWrite",
+        "ProcessStop",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch",
+        "ToolSearch",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "SendUserMessage",
+        "Agent",
+        "SendMessage",
+        "TeamCreate",
+        "TeamDelete",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskUpdate",
+        "Skill",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+        "workflow",
+        "Config",
+    }
+    if shutil.which("bash") is not None:
+        expected.add("Bash")
+    if sys.platform.startswith("win"):
+        expected.add("PowerShell")
+    assert expected <= names
+
+
+def test_tool_schemas_remove_count_limits_except_tool_search(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+
+    read = runtime.tool_registry.find_tool("Read")
+    glob = runtime.tool_registry.find_tool("Glob")
+    grep = runtime.tool_registry.find_tool("Grep")
+    web_search = runtime.tool_registry.find_tool("WebSearch")
+    tool_search = runtime.tool_registry.find_tool("ToolSearch")
+    agent = runtime.tool_registry.find_tool("Agent")
+    task_create = runtime.tool_registry.find_tool("TaskCreate")
+    assert read is not None and glob is not None and grep is not None
+    assert web_search is not None and tool_search is not None
+    assert agent is not None and task_create is not None
+
+    assert "limit" not in read.input_schema["properties"]
+    assert "max_results" not in glob.input_schema["properties"]
+    assert "max_matches" not in grep.input_schema["properties"]
+    assert "max_results" not in web_search.input_schema["properties"]
+    assert tool_search.input_schema["properties"]["max_results"]["default"] == 50
+    assert "run" not in agent.input_schema["properties"]
+    assert "command" not in task_create.input_schema["properties"]
+    assert "background" not in task_create.input_schema["properties"]
+    assert "shell" not in task_create.input_schema["properties"]
+
+
+def test_io_tools_expose_timeout_ms_and_default_to_ten_seconds(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+
+    web_search = runtime.tool_registry.find_tool("WebSearch")
+    web_fetch = runtime.tool_registry.find_tool("WebFetch")
+    assert web_search is not None and web_fetch is not None
+
+    for tool_name in ("PowerShell", "Bash", "WebSearch", "WebFetch"):
+        tool = runtime.tool_registry.find_tool(tool_name)
+        if tool is None:
+            continue
+        properties = tool.input_schema["properties"]
+        assert properties["timeout_ms"]["default"] == 10000
+        if tool_name in {"PowerShell", "Bash"}:
+            assert "timeout_seconds" not in properties
+            assert "timeout" not in properties
+            assert "input" not in properties
+            assert "run_in_background" not in properties
+        else:
+            assert properties["timeout_seconds"]["default"] == 10
+            assert properties["timeout"]["default"] == 10
+
+    assert builtin_module._timeout_seconds({}) == 10
+    assert builtin_module._timeout_seconds({"timeout": 120, "timeout_ms": 30_000}) == 30
+    assert builtin_module._timeout_seconds({"timeout_seconds": 45}) == 45
+
+
+def test_file_tools_are_callable(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+
+    write = runtime.tool_registry.find_tool("Write")
+    read = runtime.tool_registry.find_tool("Read")
+    edit = runtime.tool_registry.find_tool("Edit")
+    assert write is not None and read is not None and edit is not None
+
+    write_result = asyncio.run(
+        write.run({"file_path": "note.txt", "content": "alpha\nbeta\n"}, context)
+    )
+    assert write_result.success
+
+    edit_result = asyncio.run(
+        edit.run(
+            {"file_path": "note.txt", "old_string": "beta", "new_string": "gamma"},
+            context,
+        )
+    )
+    assert edit_result.success
+
+    read_result = asyncio.run(read.run({"file_path": "note.txt"}, context))
+    assert read_result.success
+    assert "gamma" in read_result.content
+
+
+def test_notebook_edit_tool_is_callable(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    path = tmp_path / "demo.ipynb"
+    path.write_text(
+        json.dumps(
+            {
+                "cells": [],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tool = runtime.tool_registry.find_tool("NotebookEdit")
+    assert tool is not None
+    result = asyncio.run(
+        tool.run(
+            {
+                "notebook_path": "demo.ipynb",
+                "cell_index": 0,
+                "action": "insert",
+                "cell_type": "markdown",
+                "source": "# Hello\n",
+            },
+            context,
+        )
+    )
+
+    assert result.success
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    assert notebook["cells"][0]["cell_type"] == "markdown"
+
+
+def test_local_execution_tools_are_callable(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    tool = runtime.tool_registry.find_tool("PowerShell")
+    if not sys.platform.startswith("win"):
+        assert tool is None
+        return
+    assert tool is not None
+    if shutil.which("pwsh") is None and shutil.which("powershell") is None and shutil.which("powershell.exe") is None:
+        return
+
+    result = asyncio.run(tool.run({"command": "Write-Output siyi-tool-ok"}, context))
+
+    assert result.success
+    assert "siyi-tool-ok" in result.content
+
+
+def _available_shell(runtime) -> str | None:
+    if runtime.tool_registry.find_tool("PowerShell") is not None:
+        return "PowerShell"
+    if runtime.tool_registry.find_tool("Bash") is not None:
+        return "Bash"
+    return None
+
+
+def _script_command(script: Path, shell: str) -> str:
+    if shell == "PowerShell":
+        return f'& "{sys.executable}" "{script}"'
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_shell_tool_closes_stdin_by_default(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "stdin_check.py"
+    script.write_text(
+        "import sys\n"
+        "data = sys.stdin.readline()\n"
+        "print('stdin_closed' if data == '' else 'stdin_open', flush=True)\n",
+        encoding="utf-8",
+    )
+    tool = runtime.tool_registry.find_tool(shell)
+    assert tool is not None
+
+    result = asyncio.run(
+        tool.run({"command": _script_command(script, shell), "timeout_ms": 3000}, _context(tmp_path))
+    )
+
+    assert result.success
+    assert "stdin_closed" in result.content
+
+
+def test_shell_tool_timeout_returns_timed_out(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "sleep.py"
+    script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+    tool = runtime.tool_registry.find_tool(shell)
+    assert tool is not None
+
+    result = asyncio.run(
+        tool.run({"command": _script_command(script, shell), "timeout_ms": 100}, _context(tmp_path))
+    )
+
+    assert not result.success
+    assert result.data is not None
+    assert result.data["timed_out"] is True
+
+
+def test_process_session_supports_stdin_and_stop(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "interactive.py"
+    script.write_text(
+        "import sys, time\n"
+        "print('ready', flush=True)\n"
+        "line = sys.stdin.readline().strip()\n"
+        "print('got:' + line, flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    context = _context(tmp_path)
+    start = runtime.tool_registry.find_tool("ProcessStart")
+    write = runtime.tool_registry.find_tool("ProcessWrite")
+    stop = runtime.tool_registry.find_tool("ProcessStop")
+    assert start is not None and write is not None and stop is not None
+
+    async def run_session() -> tuple[ToolResult, ToolResult, ToolResult]:
+        started_result = await start.run(
+            {
+                "shell": shell,
+                "command": _script_command(script, shell),
+                "yield_time_ms": 1500,
+            },
+            context,
+        )
+        assert started_result.data is not None
+        process_id = started_result.data["process_id"]
+        written_result = await write.run(
+            {
+                "process_id": process_id,
+                "chars": "yes\n",
+                "yield_time_ms": 300,
+            },
+            context,
+        )
+        stopped_result = await stop.run({"process_id": process_id}, context)
+        return started_result, written_result, stopped_result
+
+    started, written, stopped = asyncio.run(run_session())
+
+    assert started.success
+    assert "ready" in started.content
+    assert started.data is not None
+    assert written.success
+    assert "got:yes" in written.content
+
+    assert stopped.success
+    assert stopped.data is not None
+    assert stopped.data["status"] in {"stopped", "timed_out", "failed", "completed"}
+
+
+def test_project_management_and_lookup_tools_are_callable(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    state = tmp_path / ".siyi"
+    (state / "mcp").mkdir(parents=True)
+    (state / "mcp" / "resources.json").write_text(
+        json.dumps({"resources": [{"uri": "local://note", "name": "note", "text": "hello mcp"}]}),
+        encoding="utf-8",
+    )
+    (state / "workflows").mkdir()
+    (state / "workflows" / "empty.json").write_text(json.dumps({"steps": []}), encoding="utf-8")
+
+    async def call(name: str, payload: dict) -> str:
+        tool = runtime.tool_registry.find_tool(name)
+        assert tool is not None, name
+        result = await tool.run(payload, context)
+        assert result.success, (name, result.content)
+        return result.content
+
+    async def run_smoke() -> None:
+        await call("ToolSearch", {"query": "Read"})
+        await call("Config", {"action": "set", "key": "alpha", "value": 1})
+        await call("Config", {"action": "get", "key": "alpha"})
+        await call("Skill", {"action": "list"})
+        await call("ListMcpResourcesTool", {})
+        await call("ReadMcpResourceTool", {"uri": "local://note"})
+        await call("workflow", {"action": "list"})
+        await call("workflow", {"action": "run", "name": "empty"})
+        await call("Agent", {"action": "create", "name": "helper", "role": "test"})
+        agents = json.loads(await call("Agent", {"action": "list"}))
+        agent_id = agents[0]["agent_id"]
+        await call("SendMessage", {"target_id": agent_id, "message": "hello"})
+        await call("TeamCreate", {"name": "team", "agent_ids": [agent_id]})
+        teams = json.loads((state / "teams.json").read_text(encoding="utf-8"))
+        await call("TeamDelete", {"team_id": teams[0]["team_id"]})
+        await call("TaskCreate", {"title": "task"})
+        tasks = json.loads((state / "task_records.json").read_text(encoding="utf-8"))
+        task_id = tasks[0]["task_id"]
+        await call("TaskGet", {"task_id": task_id})
+        await call("TaskList", {})
+        await call("TaskUpdate", {"task_id": task_id, "status": "done"})
+
+    asyncio.run(run_smoke())
+
+
+class ToolCallingLLM(LLMAdapter):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_chat(
+        self,
+        messages,
+        system_prompt: str,
+        tools,
+        temperature: float,
+    ) -> AsyncIterator[LLMTextDelta | LLMToolUse | LLMAssistantDone]:
+        del system_prompt, tools, temperature
+        self.calls += 1
+        if self.calls == 1:
+            yield LLMToolUse(
+                block=ToolUseBlock(
+                    id="toolu_test",
+                    name="Write",
+                    input={"file_path": "tool-loop.txt", "content": "from tool"},
+                )
+            )
+            yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+            return
+
+        assert any(
+            message.has_tool_result()
+            and any(
+                isinstance(block, ToolResultBlock)
+                and block.tool_use_id == "toolu_test"
+                for block in message.content
+            )
+            for message in messages
+        )
+        yield LLMTextDelta(delta="tool loop complete")
+        yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+
+
+class ProgressTool(BaseTool):
+    name = "ProgressTool"
+    description = "Emit a progress delta for tests."
+    read_only = True
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def run(self, raw_input, context: ToolContext) -> ToolResult:
+        del raw_input
+        await emit_tool_output_delta(context, stream="stdout", delta="progress\n")
+        return ToolResult(success=True, content="done")
+
+
+class ProgressToolLLM(LLMAdapter):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_chat(
+        self,
+        messages,
+        system_prompt: str,
+        tools,
+        temperature: float,
+    ) -> AsyncIterator[LLMTextDelta | LLMToolUse | LLMAssistantDone]:
+        del messages, system_prompt, tools, temperature
+        self.calls += 1
+        if self.calls == 1:
+            yield LLMToolUse(block=ToolUseBlock(id="toolu_progress", name="ProgressTool", input={}))
+            yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+            return
+        yield LLMTextDelta(delta="done")
+        yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+
+
+def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
+    permissions_dir = tmp_path / ".siyi"
+    permissions_dir.mkdir()
+    (permissions_dir / "permissions.json").write_text(
+        json.dumps({"permissions": {"allow": ["Write(*)"]}}),
+        encoding="utf-8",
+    )
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.query_engine.llm = ToolCallingLLM()
+
+    async def collect():
+        return [event async for event in runtime.query_engine.submit_user_input("write a file")]
+
+    events = asyncio.run(collect())
+
+    assert any(isinstance(event, ToolResultEvent) for event in events)
+    assert isinstance(events[-1], FinalAnswerEvent)
+    assert (tmp_path / "tool-loop.txt").read_text(encoding="utf-8") == "from tool"
+    assert runtime.query_engine.llm.calls == 2
+
+
+def test_tool_output_delta_events_are_emitted_but_not_persisted(tmp_path: Path) -> None:
+    permissions_dir = tmp_path / ".siyi"
+    permissions_dir.mkdir()
+    (permissions_dir / "permissions.json").write_text(
+        json.dumps({"permissions": {"allow": ["ProgressTool(*)"]}}),
+        encoding="utf-8",
+    )
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.tool_registry.register(ProgressTool())
+    runtime.query_engine.llm = ProgressToolLLM()
+
+    async def collect():
+        return [event async for event in runtime.query_engine.submit_user_input("run progress tool")]
+
+    events = asyncio.run(collect())
+
+    assert any(isinstance(event, ToolOutputDeltaEvent) for event in events)
+    assert isinstance(events[-1], FinalAnswerEvent)
+    transcript = runtime.query_engine.session.path.read_text(encoding="utf-8")
+    assert "tool_output_delta" not in transcript

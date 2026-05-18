@@ -1,7 +1,7 @@
-.general-agent/settings.json
-.general-agent/sessions/
-**/.general-agent/settings.json
-**/.general-agent/sessions/
+.siyi/settings.json
+.siyi/sessions/
+**/.siyi/settings.json
+**/.siyi/sessions/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,3 +9,6 @@ build/
 dist/
 *.egg-info/
 examples/
+.obsidian/
+Note/
+

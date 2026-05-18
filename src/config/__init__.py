@@ -1,1 +1,1 @@
-"""Configuration loading for General Agent."""
+"""Configuration loading for SiYi."""

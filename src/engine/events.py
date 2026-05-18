@@ -36,6 +36,16 @@ class ToolResultEvent(QueryEvent):
     block: ToolResultBlock
 
 
+class ToolOutputDeltaEvent(QueryEvent):
+    type: Literal["tool_output_delta"] = "tool_output_delta"
+    tool_use_id: str
+    tool_name: str
+    stream: Literal["stdout", "stderr", "status"]
+    delta: str
+    process_id: str | None = None
+    elapsed_ms: int = 0
+
+
 class StatusEvent(QueryEvent):
     type: Literal["status"] = "status"
     message: str

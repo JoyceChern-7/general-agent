@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from rich.console import Console
+from rich.table import Table
 from rich.text import Text
 
+from engine.query_engine import SessionSnapshot
 from engine.events import (
     AssistantDeltaEvent,
     AssistantDoneEvent,
@@ -10,9 +12,11 @@ from engine.events import (
     FinalAnswerEvent,
     QueryEvent,
     StatusEvent,
+    ToolOutputDeltaEvent,
     ToolResultEvent,
     ToolUseEvent,
 )
+from engine.message_schema import Message
 
 
 class ConsoleRenderer:
@@ -21,16 +25,19 @@ class ConsoleRenderer:
         self.debug = debug
         self.print_thinking = print_thinking
         self._assistant_open = False
+        self._tool_output_open = False
 
     def render_event(self, event: QueryEvent) -> None:
         if isinstance(event, StatusEvent):
-            self.render_status(event.message)
+            self.render_status_event(event)
         elif isinstance(event, AssistantDeltaEvent):
             self.render_assistant_delta(event.delta)
         elif isinstance(event, AssistantDoneEvent):
             self.render_assistant_done()
         elif isinstance(event, ToolUseEvent):
             self.render_tool_use(event)
+        elif isinstance(event, ToolOutputDeltaEvent):
+            self.render_tool_output_delta(event)
         elif isinstance(event, ToolResultEvent):
             self.render_tool_result(event)
         elif isinstance(event, FinalAnswerEvent):
@@ -38,12 +45,19 @@ class ConsoleRenderer:
         elif isinstance(event, ErrorEvent):
             self.render_error(event.message)
 
+    def render_welcome(self, *, session_id: str, cwd: str, model: str) -> None:
+        self.console.print("[bold]SiYi[/bold] interactive mode")
+        self.console.print(
+            f"[dim]session={session_id} model={model} cwd={cwd}[/dim]"
+        )
+        self.console.print("[dim]Type /help for available commands.[/dim]")
+
     def render_user_message(self, text: str) -> None:
-        self.console.print(Text(f"> {text}", style="bold cyan"))
+        self.console.print(Text(f"> {text}", style="dim"))
 
     def render_assistant_delta(self, delta: str) -> None:
         if not self._assistant_open:
-            self.console.print(Text("assistant: ", style="bold green"), end="")
+            self.console.print(Text("● ", style="bold green"), end="")
             self._assistant_open = True
         self.console.print(delta, end="")
 
@@ -53,15 +67,33 @@ class ConsoleRenderer:
             self._assistant_open = False
 
     def render_tool_use(self, event: ToolUseEvent) -> None:
-        self.console.print(f"[yellow]tool_use[/yellow] {event.block.name} {event.block.input}")
+        self.render_assistant_done()
+        self.console.print(f"[dim yellow]tool call:[/dim yellow] {event.block.name} {event.block.input}")
 
     def render_tool_result(self, event: ToolResultEvent) -> None:
-        style = "red" if event.block.is_error else "green"
-        self.console.print(f"[{style}]tool_result[/{style}] {event.block.content}")
+        self.render_assistant_done()
+        if self._tool_output_open:
+            self.console.print()
+            self._tool_output_open = False
+        style = "dim red" if event.block.is_error else "dim green"
+        self.console.print(f"[{style}]tool result:[/{style}] {event.block.content}")
+
+    def render_tool_output_delta(self, event: ToolOutputDeltaEvent) -> None:
+        self.render_assistant_done()
+        style = "dim red" if event.stream == "stderr" else "dim"
+        self.console.print(Text(event.delta, style=style), end="")
+        self._tool_output_open = True
 
     def render_status(self, message: str) -> None:
         if self.debug:
             self.console.print(f"[dim]{message}[/dim]")
+
+    def render_status_event(self, event: StatusEvent) -> None:
+        highlighted_codes = {"budget_warning", "autocompact_recommended"}
+        if event.code in highlighted_codes:
+            self.console.print(f"[yellow]{event.message}[/yellow]")
+            return
+        self.render_status(event.message)
 
     def render_final(self, event: FinalAnswerEvent) -> None:
         if self.debug and event.usage:
@@ -70,3 +102,50 @@ class ConsoleRenderer:
     def render_error(self, message: str) -> None:
         self.render_assistant_done()
         self.console.print(f"[bold red]error:[/bold red] {message}")
+
+    def render_note(self, message: str) -> None:
+        self.render_assistant_done()
+        self.console.print(f"[dim]{message}[/dim]")
+
+    def render_help(self, commands: list[object]) -> None:
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Command", style="cyan", no_wrap=True)
+        table.add_column("Description")
+        for command in commands:
+            table.add_row(command.usage, command.description)
+        self.console.print(table)
+
+    def render_session(self, snapshot: SessionSnapshot) -> None:
+        table = Table(show_header=False, box=None)
+        table.add_column("Field", style="cyan", no_wrap=True)
+        table.add_column("Value")
+        table.add_row("session", snapshot.session_id)
+        table.add_row("cwd", snapshot.cwd)
+        table.add_row("model", snapshot.model)
+        table.add_row("turns", str(snapshot.turn_count))
+        table.add_row("completed_turns", str(snapshot.completed_turns))
+        table.add_row("messages", str(snapshot.message_count))
+        table.add_row("last_error", snapshot.last_error or "-")
+        table.add_row("usage", str(snapshot.total_usage))
+        table.add_row("estimated_cost", f"{snapshot.estimated_total_cost:.6f}")
+        self.console.print(table)
+
+    def render_history(self, messages: list[Message], *, limit: int) -> None:
+        self.render_assistant_done()
+        if not messages:
+            self.console.print("[dim](no transcript messages available)[/dim]")
+            return
+        self.console.print(f"[bold]Recent Messages[/bold] [dim](last {limit})[/dim]")
+        for message in messages:
+            style = {
+                "user": "cyan",
+                "assistant": "green",
+                "system": "magenta",
+            }.get(message.role, "white")
+            self.console.print(
+                Text(f"{message.role}: {message.to_plain_text()}", style=style)
+            )
+
+    def render_debug_transcript(self, transcript: str) -> None:
+        self.render_assistant_done()
+        self.console.print(transcript or "(no messages)")

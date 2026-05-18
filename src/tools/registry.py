@@ -13,7 +13,11 @@ class ToolRegistry:
 
     @classmethod
     def default(cls, permission_manager: PermissionManager) -> "ToolRegistry":
-        return cls(permission_manager=permission_manager)
+        registry = cls(permission_manager=permission_manager)
+        from tools.builtin import register_builtin_tools
+
+        register_builtin_tools(registry)
+        return registry
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

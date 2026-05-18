@@ -1,14 +1,15 @@
-**先定义这几个词**
+
+
+## `compact_boundary_message`
 
 1. `transcript`指一整个会话里保存下来的消息列表，也就是很多个 [Message](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py)。
-2. `boundary marker`指由 [compact_boundary_message()](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py#L157) 生成的那条特殊消息。它本质上也是一条 `Message`，但它有两个特殊点：
+3. `boundary marker`指由 [compact_boundary_message()](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py#L157) 生成的那条特殊消息。它本质上也是一条 `Message`，但它有两个特殊点：
 
    - `is_meta=True`
    - `metadata["subtype"] == "compact_boundary"`
-3. `provider payload`指最终发给模型供应商的消息视图。当前项目里，这一步在 [QueryEngine._prepare_turn()](C:/Users/25901/Desktop/general-agent/src/engine/query_engine.py#L185) 里先做切片，再做 [normalize_messages_for_api()](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py#L175)。
-4. `compact`
+4. `provider payload`指最终发给模型供应商的消息视图。当前项目里，这一步在 [QueryEngine._prepare_turn()](C:/Users/25901/Desktop/general-agent/src/engine/query_engine.py#L185) 里先做切片，再做 [normalize_messages_for_api()](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py#L175)。
+5. `compact`
    指“把旧上下文压缩成更短的表达”。比如把前面 40 轮对话压成一段摘要，而不是原样全带上。
-
 
 **1. 为什么需要 `compact_boundary_message`**
 
@@ -90,8 +91,9 @@ metadata={"subtype": "compact_boundary", "reason": reason}
 
 1. compact 后的“摘要消息”应该放成 `assistant message`、`system message`，还是单独的 `meta message`？
 2. 如果一个会话发生了多次 compact，为什么 [get_messages_after_compact_boundary()](C:/Users/25901/Desktop/general-agent/src/engine/message_schema.py#L167) 要“从后往前”找最近的一条 boundary？
-3. boundary 机制和 `tool_result` 截断机制有什么区别？
-4. 在你的 A 股 Agent 里，哪些内容应该被 compact，哪些内容绝对不能 compact？
+3. 在你的 A 股 Agent 里，哪些内容应该被 compact，哪些内容绝对不能 compact？
 
-如果你愿意，我下一条可以继续专门回答第 2 个问题：
-**为什么 boundary 一定要是“最近一个边界生效”，而不是“所有边界都一起处理”。**
+
+1. `assistant message`, 因为我们很多时间是通过 调用 API 来完成信息压缩的.
+2. 因为在多次 compact 后，只有**最近那次 compact**才代表"当前最新的历史压缩结果", 这是一个很聪明的设计
+3.
